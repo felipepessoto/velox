@@ -510,9 +510,38 @@ struct Selection {
     ranges_->emplace_back(offset, size);
   }
 
+  const BufferPtr& nulls() const {
+    return nulls_;
+  }
+
+  void setNulls(BufferPtr nulls) {
+    nulls_ = std::move(nulls);
+  }
+
+  bool isNullAt(vector_size_t row) const {
+    return nulls_ && bits::isBitNull(nulls_->as<uint64_t>(), row);
+  }
+
+  BufferPtr effectiveNulls(const BaseVector& vec, memory::MemoryPool* pool)
+      const {
+    if (!nulls_) {
+      return vec.nulls();
+    }
+
+    auto nulls = allocateNulls(vec.size(), pool);
+    auto* rawNulls = nulls->asMutable<uint64_t>();
+    apply([&](vector_size_t row) {
+      bits::setNull(rawNulls, row, isNullAt(row) || vec.isNullAt(row));
+    });
+    return nulls;
+  }
+
  private:
   std::optional<std::vector<std::pair<vector_size_t, vector_size_t>>> ranges_;
   vector_size_t total_;
+  // Ancestor nulls use source indices, independently of filtering and
+  // reordering.
+  BufferPtr nulls_;
 };
 
 // Gather values from time buffer. Nulls are skipped.
@@ -1155,11 +1184,16 @@ void exportRows(
   holder.resizeChildren(vec.childrenSize());
   out.n_children = vec.childrenSize();
   out.children = holder.getChildrenArrays();
+  std::optional<Selection> childRows;
+  if (vec.mayHaveNulls() && vec.getNullCount() != 0) {
+    childRows = rows;
+    childRows->setNulls(rows.effectiveNulls(vec, pool));
+  }
   for (column_index_t i = 0; i < vec.childrenSize(); ++i) {
     try {
       exportToArrowImpl(
           *vec.childAt(i)->loadedVector(),
-          rows,
+          childRows ? *childRows : rows,
           options,
           *holder.allocateChild(i),
           pool);
@@ -1197,7 +1231,8 @@ void exportOffsets(
       checkedPlus<size_t>(out.length, 1), pool);
   auto rawOffsets = offsets->asMutable<vector_size_t>();
 
-  if (!rows.changed() && isCompact(vec)) {
+  if (!rows.nulls() && !vec.mayHaveNulls() && !rows.changed() &&
+      isCompact(vec)) {
     vector_size_t rowCount = rows.count();
     memcpy(rawOffsets, vec.rawOffsets(), sizeof(vector_size_t) * rowCount);
     rawOffsets[rowCount] = rowCount == 0
@@ -1210,7 +1245,7 @@ void exportOffsets(
     vector_size_t j = 0, k = 0;
     rows.apply([&](vector_size_t i) {
       rawOffsets[j++] = k;
-      if (!vec.isNullAt(i)) {
+      if (!rows.isNullAt(i) && !vec.isNullAt(i)) {
         childRows.addRange(vec.offsetAt(i), vec.sizeAt(i));
         k += vec.sizeAt(i);
       }
@@ -1273,11 +1308,24 @@ void flattenAndExport(
     VeloxToArrowBridgeHolder& holder) {
   using NativeType = typename velox::TypeTraits<kind>::NativeType;
   SelectivityVector allRows(vec.size());
+  const bool filtered = rows.changed() || rows.nulls() != nullptr;
+  if (filtered) {
+    allRows.clearAll();
+    rows.apply([&](vector_size_t row) {
+      if (!rows.isNullAt(row)) {
+        allRows.setValid(row, true);
+      }
+    });
+    allRows.updateBounds();
+  }
   DecodedVector decoded(vec, allRows);
-  auto flatVector = BaseVector::create<FlatVector<NativeType>>(
-      vec.type(), decoded.size(), pool);
+  auto flatVector =
+      BaseVector::create<FlatVector<NativeType>>(vec.type(), vec.size(), pool);
+  if (filtered) {
+    flatVector->setNulls(allocateNulls(vec.size(), pool, bits::kNull));
+  }
 
-  if (decoded.mayHaveNulls()) {
+  if (filtered || decoded.mayHaveNulls()) {
     allRows.applyToSelected([&](vector_size_t row) {
       if (decoded.isNullAt(row)) {
         flatVector->setNull(row, true);
@@ -1312,9 +1360,20 @@ void exportDictionary(
     holder.setBuffer(1, vec.wrapInfo());
   }
   auto& values = *vec.valueVector()->loadedVector();
+  Selection valueRows(values.size());
+  if (rows.nulls() || rows.changed() || vec.mayHaveNulls()) {
+    auto nulls = allocateNulls(values.size(), pool, bits::kNull);
+    auto* rawNulls = nulls->asMutable<uint64_t>();
+    const auto* indices = vec.wrapInfo()->as<vector_size_t>();
+    rows.apply([&](vector_size_t row) {
+      if (!rows.isNullAt(row) && !vec.isNullAt(row)) {
+        bits::clearNull(rawNulls, indices[row]);
+      }
+    });
+    valueRows.setNulls(std::move(nulls));
+  }
   out.dictionary = holder.allocateDictionary();
-  exportToArrowImpl(
-      values, Selection(values.size()), options, *out.dictionary, pool);
+  exportToArrowImpl(values, valueRows, options, *out.dictionary, pool);
 }
 
 void exportFlattenedVector(
@@ -1334,6 +1393,7 @@ void exportFlattenedVector(
 
 void exportConstantValue(
     const BaseVector& vec,
+    const Selection& rows,
     const ArrowOptions& options,
     ArrowArray& out,
     memory::MemoryPool* pool) {
@@ -1368,6 +1428,18 @@ void exportConstantValue(
           vec.mayHaveNulls() ? 1 : 0);
     }
   }
+  bool hasNonNullRows = rows.count() != 0;
+  if (rows.nulls()) {
+    hasNonNullRows = false;
+    rows.apply(
+        [&](vector_size_t row) { hasNonNullRows |= !rows.isNullAt(row); });
+  }
+  if (!hasNonNullRows) {
+    selection.setNulls(allocateNulls(valuesVector->size(), pool, bits::kNull));
+  }
+  if (rows.count() == 0) {
+    selection.clearAll();
+  }
   exportToArrowImpl(*valuesVector, selection, options, out, pool);
 }
 
@@ -1388,14 +1460,14 @@ void exportConstant(
   out.n_children = 2;
   holder.resizeChildren(2);
   out.children = holder.getChildrenArrays();
-  exportConstantValue(vec, options, *holder.allocateChild(1), pool);
+  exportConstantValue(vec, rows, options, *holder.allocateChild(1), pool);
 
   // Create the run ends child.
   auto* runEnds = holder.allocateChild(0);
   auto runEndsHolder = std::make_unique<VeloxToArrowBridgeHolder>();
 
   runEnds->buffers = runEndsHolder->getArrowBuffers();
-  runEnds->length = 1;
+  runEnds->length = out.length == 0 ? 0 : 1;
   runEnds->offset = 0;
   runEnds->null_count = 0;
   runEnds->n_buffers = 2;
@@ -1405,7 +1477,7 @@ void exportConstant(
 
   // Allocate single runs buffer with the run set as size.
   auto runsBuffer = AlignedBuffer::allocate<int32_t>(1, pool);
-  runsBuffer->asMutable<int32_t>()[0] = vec.size();
+  runsBuffer->asMutable<int32_t>()[0] = out.length;
   runEndsHolder->setBuffer(1, runsBuffer);
 
   runEnds->private_data = runEndsHolder.release();
@@ -1426,9 +1498,17 @@ void exportToArrowImpl(
   exportValidityBitmap(vec, rows, options, out, pool, *holder);
 
   switch (vec.encoding()) {
-    case VectorEncoding::Simple::FLAT:
-      exportFlat(vec, rows, options, out, pool, *holder);
+    case VectorEncoding::Simple::FLAT: {
+      if (rows.nulls() && vec.typeKind() != TypeKind::UNKNOWN) {
+        auto masked = vec.slice(0, vec.size());
+        masked->setNulls(rows.effectiveNulls(vec, pool));
+        // Keep the original Arrow validity; only skip inaccessible payloads.
+        exportFlat(*masked, rows, options, out, pool, *holder);
+      } else {
+        exportFlat(vec, rows, options, out, pool, *holder);
+      }
       break;
+    }
     case VectorEncoding::Simple::ROW:
       exportRows(
           *vec.asUnchecked<RowVector>(), rows, options, out, pool, *holder);

@@ -105,6 +105,23 @@ class ArrowBridgeArrayExportTest : public testing::Test {
         VeloxUserError);
   }
 
+  void assertExportRoundTrip(const VectorPtr& input) {
+    ArrowSchema schema{};
+    ArrowArray data{};
+    velox::exportToArrow(input, schema, options_);
+    EXPECT_NO_THROW(velox::exportToArrow(input, data, pool_.get(), options_));
+    if (data.release == nullptr) {
+      schema.release(&schema);
+      return;
+    }
+
+    test::assertEqualVectors(
+        input, importFromArrowAsViewer(schema, data, pool_.get()));
+    ASSERT_OK_AND_ASSIGN(auto type, arrow::ImportType(&schema));
+    ASSERT_OK_AND_ASSIGN(auto array, arrow::ImportArray(&data, type));
+    ASSERT_OK(array->ValidateFull());
+  }
+
   // Construct and test a constant vector based on a scalar value.
   template <typename T>
   void testConstant(
@@ -713,6 +730,136 @@ TEST_F(ArrowBridgeArrayExportTest, rowVectorNullable) {
   arrowArray.release(&arrowArray);
   EXPECT_EQ(nullptr, arrowArray.release);
   EXPECT_EQ(nullptr, arrowArray.private_data);
+}
+
+TEST_F(ArrowBridgeArrayExportTest, rowVectorNullableTimestamp) {
+  // Valid in Velox, but outside Arrow's microsecond and nanosecond ranges.
+  const Timestamp overflowing(Timestamp::kMaxSeconds, 0);
+  const Timestamp first = Timestamp::fromMicros(11);
+  const Timestamp last = Timestamp::fromMicros(55);
+
+  for (const auto& type : std::vector<TypePtr>{TIMESTAMP(), TIMESTAMP_UTC()}) {
+    SCOPED_TRACE(type->toString());
+    for (auto unit : {TimestampUnit::kMicro, TimestampUnit::kNano}) {
+      SCOPED_TRACE(static_cast<int>(unit));
+      options_.timestampUnit = unit;
+      for (int encoding = 0; encoding < 3; ++encoding) {
+        SCOPED_TRACE(encoding);
+        auto timestamps = vectorMaker_.flatVector<Timestamp>(
+            {first, overflowing, overflowing, overflowing, last, overflowing},
+            type);
+        timestamps->setNull(2, true);
+        timestamps->setNullCount(1);
+        VectorPtr child = timestamps;
+        if (encoding != 0) {
+          child = BaseVector::wrapInDictionary(
+              nullptr, makeBuffer<vector_size_t>({4, 3, 2, 1, 0}), 5, child);
+        }
+        options_.flattenDictionary = encoding == 2;
+
+        auto offsets = makeBuffer<vector_size_t>({0, 1, 2, 3, 4});
+        auto sizes = makeBuffer<vector_size_t>({1, 1, 1, 1, 1});
+        auto arrays = std::make_shared<ArrayVector>(
+            pool_.get(), ARRAY(type), nullptr, 5, offsets, sizes, child);
+        auto maps = std::make_shared<MapVector>(
+            pool_.get(),
+            MAP(INTEGER(), type),
+            nullptr,
+            5,
+            offsets,
+            sizes,
+            vectorMaker_.flatVector<int32_t>({0, 1, 2, 3, 4}),
+            child);
+        auto nested = std::make_shared<RowVector>(
+            pool_.get(),
+            ROW(
+                {{"ts", type},
+                 {"array", arrays->type()},
+                 {"map", maps->type()}}),
+            nullptr,
+            5,
+            std::vector<VectorPtr>{child, arrays, maps});
+        nested->setNull(3, true);
+        nested->setNullCount(1);
+        auto input = vectorMaker_.rowVector({nested});
+        input->setNull(1, true);
+        input->setNullCount(1);
+        assertExportRoundTrip(input);
+
+        // Reorder and repeat rows while retaining both levels of row nulls.
+        auto selected = std::make_shared<ArrayVector>(
+            pool_.get(),
+            ARRAY(input->type()),
+            nullptr,
+            3,
+            makeBuffer<vector_size_t>({4, 1, 1}),
+            makeBuffer<vector_size_t>({1, 3, 1}),
+            input);
+        assertExportRoundTrip(selected);
+
+        EXPECT_FALSE(nested->isNullAt(1));
+        EXPECT_FALSE(timestamps->isNullAt(1));
+        EXPECT_FALSE(timestamps->isNullAt(3));
+        EXPECT_EQ(overflowing, timestamps->valueAt(1));
+        EXPECT_EQ(overflowing, timestamps->valueAt(3));
+        EXPECT_EQ(first, timestamps->valueAt(0));
+        EXPECT_EQ(last, timestamps->valueAt(4));
+      }
+
+      ArrowArray data{};
+      const auto visible =
+          vectorMaker_.flatVector<Timestamp>({overflowing}, type);
+      VELOX_ASSERT_THROW(
+          velox::exportToArrow(visible, data, pool_.get(), options_),
+          fmt::format(
+              "Could not convert Timestamp({}, 0) to {}",
+              Timestamp::kMaxSeconds,
+              unit == TimestampUnit::kMicro ? "microseconds" : "nanoseconds"));
+    }
+  }
+}
+
+TEST_F(ArrowBridgeArrayExportTest, rowVectorNullableConstant) {
+  const Timestamp overflowing(Timestamp::kMaxSeconds, 0);
+  const auto constant = BaseVector::wrapInConstant(
+      3, 0, vectorMaker_.flatVector<Timestamp>({overflowing}));
+  auto input = vectorMaker_.rowVector({constant});
+  input->setNulls(allocateNulls(input->size(), pool_.get(), bits::kNull));
+  options_.timestampUnit = TimestampUnit::kMicro;
+
+  for (bool flatten : {false, true}) {
+    SCOPED_TRACE(flatten);
+    options_.flattenConstant = flatten;
+    assertExportRoundTrip(input);
+    EXPECT_FALSE(constant->isNullAt(0));
+
+    auto selected = std::make_shared<ArrayVector>(
+        pool_.get(),
+        ARRAY(input->type()),
+        nullptr,
+        2,
+        makeBuffer<vector_size_t>({2, 0}),
+        makeBuffer<vector_size_t>({1, 1}),
+        input);
+    assertExportRoundTrip(selected);
+
+    auto empty = std::make_shared<ArrayVector>(
+        pool_.get(),
+        ARRAY(TIMESTAMP()),
+        allocateNulls(1, pool_.get(), bits::kNull),
+        1,
+        makeBuffer<vector_size_t>({0}),
+        makeBuffer<vector_size_t>({3}),
+        constant);
+    assertExportRoundTrip(empty);
+
+    ArrowArray data{};
+    VELOX_ASSERT_THROW(
+        velox::exportToArrow(constant, data, pool_.get(), options_),
+        fmt::format(
+            "Could not convert Timestamp({}, 0) to microseconds",
+            Timestamp::kMaxSeconds));
+  }
 }
 
 TEST_F(ArrowBridgeArrayExportTest, rowVectorEmpty) {
